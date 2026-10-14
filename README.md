@@ -304,6 +304,21 @@ launching terminal won't kill it either.
 - **Mac: client aborts on start (SIGABRT)** — Tk/pynput Cocoa clash. You should
   be on the build that inits Tk on the main thread first; if it persists, run
   with `TETHER_NO_TK=1`.
+- **Mac: `KeyError: 'AXIsProcessTrusted'` / "listener failed to start"** —
+  pyobjc has no metadata for your Python (seen on bleeding-edge builds like
+  3.15). The client auto-applies a ctypes shim that bypasses this, so it should
+  just work now. If it still fails, the guaranteed fix is a **Python 3.13**
+  venv: `python3.13 -m venv .venv && source .venv/bin/activate && pip install pynput`.
+- **Mac: armed but keys/mouse do nothing** — the terminal lacks macOS
+  **Accessibility** and/or **Input Monitoring** permission (the client prints a
+  NOTE when it detects this). Grant both in System Settings → Privacy &
+  Security, then restart the client.
+- **Resolution switch (F9) glitches / stream stalls** — fixed: capture now runs
+  in its own process group and is fully killed (incl. the wlroots
+  `wf-recorder | ffmpeg` pipeline) before the new one binds, ffplay runs with
+  `-autoexit` so it reconnects on stream-end, and double-presses are debounced.
+  A brief (~1s) blink during the switch is normal — the stream genuinely
+  restarts at the new resolution.
 
 # Known limits / next up
 

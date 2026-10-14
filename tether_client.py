@@ -36,6 +36,54 @@ try:
 except ImportError:
     sys.exit("Missing dependency: pip install pynput")
 
+
+def _patch_pyobjc_trust():
+    """Work around pynput crashing on bleeding-edge Python (e.g. 3.15).
+
+    pynput does `import HIServices; HIServices.AXIsProcessTrusted()` to check the
+    macOS Accessibility permission. On a Python that pyobjc doesn't yet ship
+    metadata for, pyobjc's lazy loader can't resolve that symbol and throws
+    `KeyError: 'AXIsProcessTrusted'`, killing the listener thread — so input
+    forwarding silently dies. We load the function straight from the
+    ApplicationServices framework via ctypes (no pyobjc metadata involved) and
+    splice it into the exact name pynput reads. No-op if pyobjc already works,
+    or off macOS."""
+    if sys.platform != "darwin":
+        return
+    try:
+        from pynput._util import darwin as _d
+    except Exception:
+        return
+    try:
+        _d.HIServices.AXIsProcessTrusted          # already resolvable? leave it.
+        return
+    except Exception:
+        pass
+    try:
+        import ctypes, ctypes.util
+        fw = (ctypes.util.find_library("ApplicationServices")
+              or "/System/Library/Frameworks/ApplicationServices.framework/"
+                 "ApplicationServices")
+        lib = ctypes.CDLL(fw)
+        lib.AXIsProcessTrusted.restype = ctypes.c_bool
+        lib.AXIsProcessTrusted.argtypes = []
+        _real = _d.HIServices
+
+        class _HIShim:
+            def AXIsProcessTrusted(self):
+                return bool(lib.AXIsProcessTrusted())
+            def __getattr__(self, name):
+                return getattr(_real, name)   # delegate anything else to pyobjc
+
+        _d.HIServices = _HIShim()
+        print("[tether] applied pyobjc/AXIsProcessTrusted compatibility shim")
+    except Exception as e:
+        print(f"[tether] could not apply pyobjc shim ({e!r}); if the listener "
+              f"fails, use Python 3.13 (see README).")
+
+
+_patch_pyobjc_trust()
+
 # Set TETHER_NO_TK=1 to force terminal chat even when Tk is importable (escape
 # hatch for the macOS Tk/pynput Cocoa clash).
 try:
@@ -167,9 +215,14 @@ class Client:
     # -- video ---------------------------------------------------------------
     def start_video(self):
         url = f"tcp://{self.host}:{VIDEO_PORT}"
-        cmd = ["ffplay", "-loglevel", "error", "-fflags", "nobuffer",
-               "-flags", "low_delay", "-framedrop", "-probesize", "32",
-               "-sync", "ext", "-window_title", "tether — ubuntu", url]
+        # -autoexit is essential: without it ffplay freezes on the last frame at
+        # end-of-stream instead of quitting, so the reconnect loop never runs.
+        # That end-of-stream happens on every quality switch (F9) and whenever
+        # the daemon re-execs capture — ffplay must exit so we can reconnect.
+        cmd = ["ffplay", "-loglevel", "error", "-autoexit",
+               "-fflags", "nobuffer", "-flags", "low_delay", "-framedrop",
+               "-probesize", "32", "-sync", "ext",
+               "-window_title", "tether — ubuntu", url]
         return subprocess.Popen(cmd)
 
     def _video_loop(self):
@@ -207,6 +260,12 @@ class Client:
         print(f"[tether] forwarding {'ARMED — Mac keyboard+trackpad drive Linux' if self.armed else 'DISARMED'}")
 
     def _toggle_quality(self):
+        # Debounce: ignore a new toggle while the last switch is still landing,
+        # so a quick double-press can't desync the Mac's and daemon's idea of
+        # the current quality (which would leave the stream stuck mid-handoff).
+        if self._pending_restart:
+            print("[tether] quality switch already in progress — ignoring")
+            return
         self.quality = "high" if self.quality == "low" else "low"
         self._pending_restart = True
         self.send({"t": "quality", "level": self.quality})
@@ -355,6 +414,37 @@ class Client:
                         on_scroll=self.on_scroll)
         self.kb.start()
         self.ms.start()
+        # pynput's listeners run on background threads; a failure there (bad
+        # pyobjc, no Accessibility permission) kills the thread silently and
+        # input forwarding just never works. Catch that and say so loudly.
+        threading.Thread(target=self._watch_listeners, daemon=True).start()
+
+    def _watch_listeners(self):
+        time.sleep(1.0)
+        dead = [n for n, l in (("keyboard", self.kb), ("mouse", self.ms))
+                if not l.is_alive()]
+        if dead:
+            print(f"\n[tether] WARNING: {', '.join(dead)} listener failed to start — "
+                  f"input forwarding is NOT working.")
+            print("[tether]   Likely pynput/pyobjc can't run on this Python. Reinstall "
+                  "pyobjc (pip install -U pyobjc) or use Python 3.13 (see README). "
+                  "Video still works.")
+            return
+        # Listeners are alive — but on macOS they receive nothing until the app
+        # has Accessibility permission. Check and say so, since that's the most
+        # common "armed but keys do nothing" cause.
+        if sys.platform == "darwin":
+            try:
+                from pynput._util import darwin as _d
+                if not bool(_d.HIServices.AXIsProcessTrusted()):
+                    print("\n[tether] NOTE: this terminal doesn't have macOS "
+                          "Accessibility permission yet — keys/mouse won't reach "
+                          "Linux until you grant it.")
+                    print("[tether]   System Settings → Privacy & Security → "
+                          "Accessibility AND Input Monitoring → enable your "
+                          "terminal app, then restart tether_client.py.")
+            except Exception:
+                pass
 
     def _poll_tk(self):
         try:

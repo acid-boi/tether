@@ -454,11 +454,34 @@ class Capture(threading.Thread):
             return pipe, True
         return None, False
 
+    def _kill_proc(self, grace=3.0):
+        """Kill the current capture and its whole process group, and wait for the
+        OS to release port 9000 before returning."""
+        p = self.proc
+        if not p or p.poll() is not None:
+            return
+        try:
+            os.killpg(os.getpgid(p.pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                p.terminate()
+            except OSError:
+                pass
+        try:
+            p.wait(timeout=grace)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+
     def restart(self):
         """Force the capture to re-exec with current settings (quality switch)."""
         self._restart = True
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
+        self._kill_proc()
 
     def run(self):
         if self._backend() == "wlroots" and os.geteuid() == 0:
@@ -476,9 +499,15 @@ class Capture(threading.Thread):
                 f"(backend={self._backend()})")
             started = time.monotonic()
             try:
+                # start_new_session=True puts the capture (and, for the wlroots
+                # shell pipeline, BOTH wf-recorder and ffmpeg) in its own process
+                # group, so restart()/stop() can kill the whole group. Without
+                # this, terminating a shell pipeline orphans ffmpeg, which keeps
+                # holding port 9000 and breaks the next capture / quality switch.
                 self.proc = subprocess.Popen(
                     cmd, shell=shell,
-                    stdin=subprocess.PIPE if shell else None)
+                    stdin=subprocess.PIPE if shell else None,
+                    start_new_session=True)
                 if shell and self.proc.stdin:
                     # wf-recorder asks "Output file /dev/stdout exists. Overwrite?"
                     # Answer it so capture never blocks on the terminal. (Harmless
@@ -504,6 +533,7 @@ class Capture(threading.Thread):
                 self._restart = False
                 fast_fails = 0
                 log(f"switching stream to {self.d.quality} quality — restarting capture")
+                time.sleep(0.5)        # let the socket + old viewer fully clear
                 continue
             ran_for = time.monotonic() - started
             if ran_for >= 2.0:
@@ -538,12 +568,7 @@ class Capture(threading.Thread):
             time.sleep(1)
 
     def stop(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.terminate()
-            try:
-                self.proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        self._kill_proc()
 
 
 # ----------------------------------------------------------------------------
