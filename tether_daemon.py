@@ -27,9 +27,9 @@ import signal
 import socket
 import subprocess
 import sys
+import random
 import threading
 import time
-from collections import deque
 
 try:
     from evdev import InputDevice, UInput, categorize, ecodes, list_devices
@@ -53,6 +53,11 @@ class Cfg:
     DEFAULT_QUALITY = os.environ.get("TETHER_QUALITY", "low")   # low|high
     LOW_HEIGHT      = int(os.environ.get("TETHER_LOW_HEIGHT", 720))
     LOW_MAXRATE     = os.environ.get("TETHER_LOW_MAXRATE", "2M")
+
+    # Paste typing cadence (F7). Base delay between keystrokes + random jitter,
+    # so pasted text types out like a person instead of dumping instantly.
+    PASTE_DELAY  = float(os.environ.get("TETHER_PASTE_DELAY", 0.045))   # base seconds/char
+    PASTE_JITTER = float(os.environ.get("TETHER_PASTE_JITTER", 0.05))   # extra random 0..J
 
     # Hotkey tuning
     SEQ_WINDOW   = float(os.environ.get("TETHER_SEQ_WINDOW", 1.2))  # seconds between presses in a run
@@ -207,7 +212,9 @@ class VirtualKeyboard:
     def type_text(self, text):
         """Type a string by synthesizing key events (used by the PASTE feature).
         Runs on its own thread; the lock keeps it from interleaving with live
-        keystrokes. A small per-char delay keeps fast apps from dropping chars."""
+        keystrokes. Keys land with a human-like cadence (base delay + jitter,
+        plus a small beat after spaces/punctuation) so it reads as typing rather
+        than an instant dump."""
         for ch in text:
             with self._lock:
                 if ch in ("\n", "\r"):
@@ -217,9 +224,16 @@ class VirtualKeyboard:
                 else:
                     entry = TYPE_MAP.get(ch)
                     if entry is None:
-                        continue            # skip chars we can't map (US layout)
+                        continue            # skip chars we can't map (US layout); no pause
                     self._tap(entry[0], entry[1])
-            time.sleep(0.004)
+            # cadence: base + random jitter, with a longer beat at word/line
+            # breaks and after punctuation, the way real typing ebbs and flows.
+            delay = Cfg.PASTE_DELAY + random.uniform(0.0, Cfg.PASTE_JITTER)
+            if ch in " \n\t":
+                delay += Cfg.PASTE_DELAY * 0.8
+            elif ch in ".,;:!?":
+                delay += Cfg.PASTE_DELAY * 1.5
+            time.sleep(delay)
 
     def close(self):
         try:
@@ -629,9 +643,12 @@ class ControlServer(threading.Thread):
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
                 if line.strip():
-                    self._handle(line)
+                    self._dispatch(line)
 
-    def _handle(self, line):
+    # NB: not named _handle — Python 3.13's threading.Thread has its own
+    # self._handle (_thread._ThreadHandle), which would shadow this method and
+    # cause "'_thread._ThreadHandle' object is not callable" when invoked.
+    def _dispatch(self, line):
         try:
             msg = json.loads(line)
         except ValueError:
