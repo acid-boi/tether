@@ -657,10 +657,12 @@ class ControlServer(threading.Thread):
         if t == "key":
             val = int(msg.get("val", 1))
             code = None
-            if "name" in msg:
+            if "code" in msg:               # raw evdev keycode (Linux client)
+                code = int(msg["code"])
+            elif "name" in msg:             # named key (Mac client)
                 nm = msg["name"]
                 code = resolve_cmd() if nm == "cmd" else NAME_TO_KEY.get(nm)
-            elif "char" in msg:
+            elif "char" in msg:             # printable char (Mac client)
                 code = CHAR_TO_KEY.get(msg["char"])
             if code is not None:
                 self.d.vkbd.press(code, val)
