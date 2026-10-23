@@ -54,11 +54,19 @@ QUALITY_KEY  = ecodes.KEY_F9      # toggle remote stream quality low<->high
 PASTE_KEY    = ecodes.KEY_F7      # type local clipboard into the remote
 HOTKEYS      = {ARM_KEY, QUALITY_KEY, PASTE_KEY}
 MOUSE_SENS   = float(os.environ.get("TETHER_MOUSE_SENS", "1.0"))
+# Touchpad (absolute EV_ABS devices) tuning: finger motion is converted to
+# relative deltas. GAIN is pixels-per-mm when the pad reports a resolution;
+# FLAT is the fallback units->px factor when it doesn't.
+TOUCHPAD_GAIN = float(os.environ.get("TETHER_TOUCHPAD_GAIN", "8.0"))
+TOUCHPAD_FLAT = float(os.environ.get("TETHER_TOUCHPAD_FLAT", "0.35"))
 
 VIRTUAL_NAMES = ("tether-virtual-kbd", "tether-virtual-mouse")  # never grab these
 MOUSE_BUTTONS = {
     ecodes.BTN_LEFT: "left", ecodes.BTN_RIGHT: "right", ecodes.BTN_MIDDLE: "middle",
 }
+# multi-finger tool codes — used to suppress cursor jumps during gestures
+MULTI_FINGER = (ecodes.BTN_TOOL_DOUBLETAP, ecodes.BTN_TOOL_TRIPLETAP,
+                ecodes.BTN_TOOL_QUADTAP)
 
 
 def clipboard_text():
@@ -91,9 +99,17 @@ class Client:
         self.chat_text = None
         self.devices = []
         self._grabbed = False
-        # accumulators flushed on SYN_REPORT
+        # relative-pointer accumulators flushed on SYN_REPORT
         self._adx = self._ady = 0
         self._asx = self._asy = 0
+        # touchpad (absolute) state: current finger pos, last pos while down,
+        # contact/gesture flags, and fractional remainder for smooth slow motion
+        self._abs_x = self._abs_y = None
+        self._pad_prev = None
+        self._pad_fx = self._pad_fy = 0.0
+        self._touching = False
+        self._two_finger = False
+        self._pad_scale = TOUCHPAD_FLAT
 
     # ------------------------------------------------------------------ control
     def _control_loop(self):
@@ -190,20 +206,42 @@ class Client:
                 continue
             if dev.name in VIRTUAL_NAMES:
                 continue
-            caps = dev.capabilities()
+            caps = dev.capabilities(absinfo=True)   # EV_ABS -> [(code, AbsInfo), ...]
             keys = caps.get(ecodes.EV_KEY, [])
             rels = caps.get(ecodes.EV_REL, [])
+            abs_list = caps.get(ecodes.EV_ABS, [])
+            abs_codes = {c for (c, _info) in abs_list}
             is_kbd = ecodes.KEY_ESC in keys and ecodes.KEY_A in keys
             is_ptr = ecodes.REL_X in rels and ecodes.REL_Y in rels
-            if is_kbd or is_ptr:
+            # a touchpad: reports contact (BTN_TOUCH) and absolute X/Y (ST or MT)
+            has_xy = ((ecodes.ABS_X in abs_codes and ecodes.ABS_Y in abs_codes) or
+                      (ecodes.ABS_MT_POSITION_X in abs_codes and
+                       ecodes.ABS_MT_POSITION_Y in abs_codes))
+            is_pad = ecodes.BTN_TOUCH in keys and has_xy
+            if is_kbd or is_ptr or is_pad:
                 found.append(dev)
-                kind = "+".join(k for k, c in (("keyboard", is_kbd),
-                                               ("pointer", is_ptr)) if c)
-                print(f"[tether] input device: {dev.name} ({path}) [{kind}]")
+                if is_pad:
+                    self._pad_scale = self._compute_pad_scale(abs_list, abs_codes)
+                kinds = [k for k, c in (("keyboard", is_kbd), ("pointer", is_ptr),
+                                        ("touchpad", is_pad)) if c]
+                print(f"[tether] input device: {dev.name} ({path}) [{'+'.join(kinds)}]")
         if not found:
             print("[tether] WARNING: no keyboard/mouse found. Are you in the "
                   "'input' group? (sudo usermod -aG input $USER, then re-login)")
         return found
+
+    def _compute_pad_scale(self, abs_list, abs_codes):
+        """units->pixels factor for a touchpad. Prefer the pad's reported
+        resolution (units/mm) so speed is consistent across hardware."""
+        xcode = (ecodes.ABS_X if ecodes.ABS_X in abs_codes
+                 else ecodes.ABS_MT_POSITION_X)
+        for code, info in abs_list:
+            if code == xcode:
+                res = getattr(info, "resolution", 0) or 0
+                if res > 0:
+                    return TOUCHPAD_GAIN / res
+                break
+        return TOUCHPAD_FLAT
 
     def _set_grab(self, on):
         if on == self._grabbed:
@@ -245,6 +283,7 @@ class Client:
             if self.armed and (self._asx or self._asy):
                 self.send({"t": "mscroll", "dx": self._asx, "dy": self._asy})
             self._adx = self._ady = self._asx = self._asy = 0
+            self._flush_touchpad()
             return
 
         if e.type == ecodes.EV_KEY:
@@ -253,7 +292,16 @@ class Client:
                 if val == 1:
                     self._hotkey(code)
                 return
-            if code in MOUSE_BUTTONS:
+            if code == ecodes.BTN_TOUCH:          # finger on/off the touchpad
+                self._touching = (val == 1)
+                if not self._touching:
+                    self._pad_prev = None         # lift => no delta across gaps
+                return
+            if code in MULTI_FINGER:              # 2+ fingers: a gesture, not a move
+                self._two_finger = (val == 1)
+                self._pad_prev = None             # avoid a jump when fingers change
+                return
+            if code in MOUSE_BUTTONS:             # incl. physical clickpad press
                 if self.armed and val in (0, 1):
                     self.send({"t": "mbtn", "btn": MOUSE_BUTTONS[code], "val": val})
                 return
@@ -270,6 +318,32 @@ class Client:
                 self._asy += e.value
             elif e.code == ecodes.REL_HWHEEL:
                 self._asx += e.value
+            return
+
+        if e.type == ecodes.EV_ABS:
+            if e.code in (ecodes.ABS_X, ecodes.ABS_MT_POSITION_X):
+                self._abs_x = e.value
+            elif e.code in (ecodes.ABS_Y, ecodes.ABS_MT_POSITION_Y):
+                self._abs_y = e.value
+
+    def _flush_touchpad(self):
+        """Convert the touchpad's absolute finger position into relative motion.
+        Called once per SYN frame. Single finger only — two-finger frames are
+        suppressed so gestures don't jump the cursor."""
+        if (not self._touching or self._two_finger
+                or self._abs_x is None or self._abs_y is None):
+            return
+        if self._pad_prev is not None and self.armed:
+            dx = (self._abs_x - self._pad_prev[0]) * self._pad_scale * MOUSE_SENS
+            dy = (self._abs_y - self._pad_prev[1]) * self._pad_scale * MOUSE_SENS
+            self._pad_fx += dx
+            self._pad_fy += dy
+            idx, idy = int(self._pad_fx), int(self._pad_fy)   # keep fractional part
+            if idx or idy:
+                self.send({"t": "mmove", "dx": idx, "dy": idy})
+                self._pad_fx -= idx
+                self._pad_fy -= idy
+        self._pad_prev = (self._abs_x, self._abs_y)
 
     def _hotkey(self, code):
         if code == ARM_KEY:
